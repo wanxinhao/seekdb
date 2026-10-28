@@ -238,6 +238,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/engine/basic/ob_select_into_op.cpp",
             "src/sql/engine/basic/ob_select_into_basic.cpp",
             "src/sql/engine/basic/ob_external_file_writer.cpp",
+            "src/sql/engine/basic/ob_file_scan_utils.cpp",
             "src/sql/engine/basic/ob_temp_table_access_op.cpp",
             "src/sql/engine/basic/ob_temp_table_insert_op.cpp",
             "src/sql/engine/basic/ob_temp_table_transformation_op.cpp",
