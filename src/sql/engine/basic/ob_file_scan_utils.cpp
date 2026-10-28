@@ -193,15 +193,15 @@ int dup_string_arg(const ObFileSqlArg &arg, ObArenaAllocator &allocator, ObStrin
 int parse_compression_arg(const ObString &value, ObCSVGeneralFormat::ObCSVCompression &compression)
 {
   int ret = OB_SUCCESS;
-  if (is_equal_ignore_case(value, "none") {
+  if (is_equal_ignore_case(value, "none")) {
     compression = ObCSVGeneralFormat::ObCSVCompression::NONE;
-  } else if (is_equal_ignore_case(value, "gzip") {
+  } else if (is_equal_ignore_case(value, "gzip")) {
     compression = ObCSVGeneralFormat::ObCSVCompression::GZIP;
-  } else if (is_equal_ignore_case(value, "deflate") {
+  } else if (is_equal_ignore_case(value, "deflate")) {
     compression = ObCSVGeneralFormat::ObCSVCompression::DEFLATE;
-  } else if (is_equal_ignore_case(value, "zstd") {
+  } else if (is_equal_ignore_case(value, "zstd")) {
     compression = ObCSVGeneralFormat::ObCSVCompression::ZSTD;
-  } else if (is_equal_ignore_case(value, "auto") {
+  } else if (is_equal_ignore_case(value, "auto")) {
     compression = ObCSVGeneralFormat::ObCSVCompression::AUTO;
   } else {
     ret = OB_NOT_SUPPORTED;
@@ -229,13 +229,13 @@ int parse_encoding_arg(const ObString &value, ObCharsetType &cs_type)
 int ObFileSqlUtils::get_format_type(const ObString &func_name, ObFileScanFormat &type)
 {
   int ret = OB_SUCCESS;
-  if (is_equal_ignore_case(func_name, "read_csv") {
+  if (is_equal_ignore_case(func_name, "read_csv")) {
     type = ObFileScanFormat::CSV;
   } else if (is_equal_ignore_case(func_name, "read_json") || is_equal_ignore_case(func_name, "read_ndjson")) {
     type = ObFileScanFormat::JSON;
-  } else if (is_equal_ignore_case(func_name, "read_parquet") {
+  } else if (is_equal_ignore_case(func_name, "read_parquet")) {
     type = ObFileScanFormat::PARQUET;
-  } else if (is_equal_ignore_case(func_name, "glob") {
+  } else if (is_equal_ignore_case(func_name, "glob")) {
     type = ObFileScanFormat::GLOB;
   } else {
     ret = OB_NOT_SUPPORTED;
@@ -295,8 +295,9 @@ int ObFileSqlUtils::build_csv_format(const ObIArray<ObFileSqlArg> &args,
     ObString null_str;
     if (OB_FAIL(dup_string_arg(*arg, allocator, null_str))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else if (OB_FAIL(csv_format.null_if_.push_back(null_str))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(csv_format.null_if_.allocate_array(allocator, 1))) {
+    } else {
+      csv_format.null_if_.at(0) = null_str;
     }
   }
   if (OB_SUCC(ret) && OB_FAIL(find_named_arg(args, "compression", arg))) {
