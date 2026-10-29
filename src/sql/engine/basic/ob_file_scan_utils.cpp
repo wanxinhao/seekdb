@@ -8,13 +8,17 @@
 
 #include "sql/engine/basic/ob_file_scan_utils.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 
 #include "lib/allocator/ob_malloc.h"
 #include "lib/charset/ob_charset.h"
+#include "lib/container/ob_se_array.h"
 #include "lib/file/ob_file.h"
 #include "lib/string/ob_sql_string.h"
+#include "sql/engine/basic/ob_file_csv_reader.h"
 
 namespace oceanbase
 {
@@ -26,44 +30,6 @@ using namespace common;
 namespace
 {
 
-/// read a whole local file into a buffer; used by schema inference only
-int read_whole_file(const ObString &file_url, ObArenaAllocator &allocator, ObString &content)
-{
-  int ret = OB_SUCCESS;
-  const int64_t file_size = get_file_size(file_url.ptr());
-  if (file_size < 0) {
-    ret = OB_FILE_NOT_EXIST;
-    LOG_USER_ERROR(OB_FILE_NOT_EXIST, file_url.length(), file_url.ptr());
-  } else if (false) {
-    ret = OB_SIZE_OVERFLOW;
-    LOG_WARN("invalid file size", K(file_size), K(file_url));
-  } else {
-    char *buf = NULL;
-    if (file_size == 0) {
-      buf = static_cast<char *>(allocator.alloc(1));
-      if (OB_ISNULL(buf)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-      }
-    } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(file_size)))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
-      ObFileReader reader;
-      int64_t read_size = 0;
-      if (OB_FAIL(reader.open(file_url, false))) {
-        ret = OB_FILE_NOT_EXIST;
-        LOG_USER_ERROR(OB_FILE_NOT_EXIST, file_url.length(), file_url.ptr());
-      } else if (OB_FAIL(reader.pread(buf, file_size, 0, read_size))) {
-        ret = OB_IO_ERROR;
-        LOG_WARN("failed to read file", K(ret), K(file_url));
-      } else {
-        content.assign(buf, read_size);
-      }
-      reader.close();
-    }
-  }
-  return ret;
-}
-
 /// compare a string with a literal, ignoring the case
 inline bool is_equal_ignore_case(const ObString &value, const char *literal)
 {
@@ -71,22 +37,51 @@ inline bool is_equal_ignore_case(const ObString &value, const char *literal)
   return value.length() == len && 0 == strncasecmp(value.ptr(), literal, len);
 }
 
-/// check whether a value is a valid decimal integer
+/// check whether [ptr, ptr+len) contains only decimal digits
+bool is_digits(const char *ptr, const int64_t len)
+{
+  if (NULL == ptr || len <= 0) {
+    return false;
+  }
+  for (int64_t i = 0; i < len; ++i) {
+    if (ptr[i] < '0' || ptr[i] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// parse a signed decimal integer.  Returns false when the value is not an
+/// integer or does not fit into int64 (the caller then falls back to DOUBLE).
+bool parse_int64(const ObString &value, int64_t &out)
+{
+  bool valid = false;
+  if (value.length() > 0 && value.length() < 32) {
+    int64_t i = (value.ptr()[0] == '-' || value.ptr()[0] == '+') ? 1 : 0;
+    if (i < value.length() && is_digits(value.ptr() + i, value.length() - i)) {
+      char buf[32];
+      MEMCPY(buf, value.ptr(), value.length());
+      buf[value.length()] = '\0';
+      char *end = NULL;
+      errno = 0;
+      const long long parsed = strtoll(buf, &end, 10);
+      if (ERANGE != errno && NULL != end && end == buf + value.length()) {
+        out = static_cast<int64_t>(parsed);
+        valid = true;
+      }
+    }
+  }
+  return valid;
+}
+
+/// check whether a value is a valid decimal integer (may overflow int64)
 bool is_integer_literal(const ObString &value)
 {
   if (value.length() == 0) {
     return false;
   }
   int64_t i = (value.ptr()[0] == '-' || value.ptr()[0] == '+') ? 1 : 0;
-  if (i >= value.length()) {
-    return false;
-  }
-  for (; i < value.length(); i++) {
-    if (value.ptr()[i] < '0' || value.ptr()[i] > '9') {
-      return false;
-    }
-  }
-  return true;
+  return i < value.length() && is_digits(value.ptr() + i, value.length() - i);
 }
 
 /// check whether a value is a valid floating point number
@@ -122,6 +117,21 @@ bool is_boolean_literal(const ObString &value)
          || (value.length() == 5 && 0 == strncasecmp(value.ptr(), "false", 5));
 }
 
+inline int two_digits(const char *ptr)
+{
+  return (ptr[0] - '0') * 10 + (ptr[1] - '0');
+}
+
+inline bool is_valid_date_fields(const char *ptr)
+{
+  const int year = (ptr[0] - '0') * 1000 + (ptr[1] - '0') * 100
+                   + (ptr[2] - '0') * 10 + (ptr[3] - '0');
+  const int month = two_digits(ptr + 5);
+  const int day = two_digits(ptr + 8);
+  return year >= 1 && year <= 9999 && month >= 1 && month <= 12
+         && day >= 1 && day <= 31;
+}
+
 /// check whether a value looks like a date, i.e. YYYY-MM-DD
 bool is_date_literal(const ObString &value)
 {
@@ -129,12 +139,13 @@ bool is_date_literal(const ObString &value)
     return false;
   }
   return value.ptr()[4] == '-' && value.ptr()[7] == '-'
-         && is_integer_literal(ObString(4, value.ptr()))
-         && is_integer_literal(ObString(2, value.ptr() + 5))
-         && is_integer_literal(ObString(2, value.ptr() + 8));
+         && is_digits(value.ptr(), 4)
+         && is_digits(value.ptr() + 5, 2)
+         && is_digits(value.ptr() + 8, 2)
+         && is_valid_date_fields(value.ptr());
 }
 
-/// check whether a value looks like a datetime, i.e. YYYY-MM-DD HH:MM:SS
+/// check whether a value looks like a datetime, i.e. YYYY-MM-DD HH:MM:SS[.ffffff]
 bool is_datetime_literal(const ObString &value)
 {
   // the separator between the date and the time part may be a space or a 'T'
@@ -142,17 +153,26 @@ bool is_datetime_literal(const ObString &value)
     return false;
   }
   const char sep = value.ptr()[10];
-  if (sep != ' ' && sep != 'T') {
+  const int64_t extra = value.length() - 19;
+  if ((sep != ' ' && sep != 'T')
+      || !is_date_literal(ObString(10, value.ptr()))
+      || !is_digits(value.ptr() + 11, 2)
+      || value.ptr()[13] != ':'
+      || !is_digits(value.ptr() + 14, 2)
+      || value.ptr()[16] != ':'
+      || !is_digits(value.ptr() + 17, 2)) {
     return false;
   }
-  if (!is_date_literal(ObString(10, value.ptr()))) {
-    return false;
+  if (extra > 0) {
+    if (extra > 7 || value.ptr()[19] != '.'
+        || !is_digits(value.ptr() + 20, extra - 1)) {
+      return false;
+    }
   }
-  return is_integer_literal(ObString(2, value.ptr() + 11))
-         && value.ptr()[13] == ':'
-         && is_integer_literal(ObString(2, value.ptr() + 14))
-         && value.ptr()[16] == ':'
-         && is_integer_literal(ObString(2, value.ptr() + 17));
+  const int hour = two_digits(value.ptr() + 11);
+  const int minute = two_digits(value.ptr() + 14);
+  const int second = two_digits(value.ptr() + 17);
+  return hour <= 23 && minute <= 59 && second <= 60;
 }
 
 /// find a named option in the argument list
@@ -174,7 +194,7 @@ int find_named_arg(const ObIArray<ObFileSqlArg> &args, const char *name, const O
 }
 
 /// copy a string option value into the allocator
-int dup_string_arg(const ObFileSqlArg &arg, ObArenaAllocator &allocator, ObString &value)
+int dup_string_arg(const ObFileSqlArg &arg, ObIAllocator &allocator, ObString &value)
 {
   int ret = OB_SUCCESS;
   char *buf = NULL;
@@ -245,19 +265,23 @@ int ObFileSqlUtils::get_format_type(const ObString &func_name, ObFileScanFormat 
 }
 
 int ObFileSqlUtils::build_csv_format(const ObIArray<ObFileSqlArg> &args,
-                                     ObArenaAllocator &allocator,
+                                     ObIAllocator &allocator,
                                      ObCSVGeneralFormat &csv_format)
 {
   int ret = OB_SUCCESS;
   const ObFileSqlArg *arg = NULL;
-  // DuckDB defaults: comma separated, double quoted fields, backslash escape, header row present
+  // DuckDB defaults: comma separated, double quoted fields, header row present.
+  // The backslash escape is disabled by default, standard CSV uses doubled
+  // quotes ("") to escape a quote character.
   csv_format.field_term_str_ = ObString(1, ",");
   csv_format.line_term_str_ = ObString(1, "\n");
   csv_format.field_enclosed_char_ = '"';
-  csv_format.field_escaped_char_ = '\\';
+  csv_format.field_escaped_char_ = INT64_MAX;
   csv_format.cs_type_ = CHARSET_UTF8MB4;
   csv_format.empty_field_as_null_ = true;
   csv_format.skip_blank_lines_ = true;
+  csv_format.parse_header_ = true;
+  csv_format.skip_header_lines_ = 1;
 
   if (OB_FAIL(find_named_arg(args, "header", arg))) {
   } else if (NULL != arg) {
@@ -332,7 +356,7 @@ int ObFileSqlUtils::build_csv_format(const ObIArray<ObFileSqlArg> &args,
 }
 
 int ObFileSqlUtils::build_json_format(const ObIArray<ObFileSqlArg> &args,
-                                      ObArenaAllocator &allocator,
+                                      ObIAllocator &allocator,
                                       ObCSVGeneralFormat &json_format)
 {
   int ret = OB_SUCCESS;
@@ -378,14 +402,18 @@ bool ObFileSqlUtils::ColInfer::feed_field(const ObString &value, const ObCharset
     // a NULL value does not narrow the type
     return false;
   }
+  int64_t int_value = 0;
+  const bool fits_int64 = parse_int64(value, int_value);
   if (state_ == ST_NULL) {
     if (is_boolean_literal(value)) {
       state_ = ST_BOOLEAN;
-    } else if (is_integer_literal(value)) {
+    } else if (fits_int64) {
       state_ = ST_INT;
-      const int64_t v = strtoll(value.ptr(), nullptr, 10);
-      bigint_min_ = std::min(bigint_min_, v);
-      bigint_max_ = std::max(bigint_max_, v);
+      bigint_min_ = std::min(bigint_min_, int_value);
+      bigint_max_ = std::max(bigint_max_, int_value);
+    } else if (is_integer_literal(value)) {
+      // an integer literal that overflows int64 can only be represented as DOUBLE
+      state_ = ST_DOUBLE;
     } else if (is_double_literal(value)) {
       state_ = ST_DOUBLE;
     } else if (is_date_literal(value)) {
@@ -403,11 +431,10 @@ bool ObFileSqlUtils::ColInfer::feed_field(const ObString &value, const ObCharset
       max_varchar_len_ = value.length();
     }
   } else if (state_ == ST_INT) {
-    if (is_integer_literal(value)) {
-      const int64_t v = strtoll(value.ptr(), nullptr, 10);
-      bigint_min_ = std::min(bigint_min_, v);
-      bigint_max_ = std::max(bigint_max_, v);
-    } else if (is_double_literal(value)) {
+    if (fits_int64) {
+      bigint_min_ = std::min(bigint_min_, int_value);
+      bigint_max_ = std::max(bigint_max_, int_value);
+    } else if (is_integer_literal(value) || is_double_literal(value)) {
       state_ = ST_DOUBLE;
     } else {
       state_ = ST_VARCHAR;
@@ -428,7 +455,8 @@ bool ObFileSqlUtils::ColInfer::feed_field(const ObString &value, const ObCharset
       max_varchar_len_ = value.length();
     }
   } else if (state_ == ST_DATETIME) {
-    if (!is_datetime_literal(value)) {
+    // a date-only value is still representable as a datetime
+    if (!is_datetime_literal(value) && !is_date_literal(value)) {
       state_ = ST_VARCHAR;
       max_varchar_len_ = value.length();
     }
@@ -442,6 +470,7 @@ void ObFileSqlUtils::ColInfer::finish(ObObjType &data_type,
                                       int32_t &max_varchar_len,
                                       ObCollationType &collation_type)
 {
+  collation_type = CS_TYPE_UTF8MB4_BIN;
   switch (state_) {
     case ST_NULL:
       data_type = ObNullType;
@@ -464,7 +493,9 @@ void ObFileSqlUtils::ColInfer::finish(ObObjType &data_type,
       max_varchar_len = 0;
       break;
     case ST_DATETIME:
-      data_type = ObTimestampType;
+      // keep the wall clock value as DATETIME instead of TIMESTAMP so that no
+      // time zone conversion is applied when the value is read back.
+      data_type = ObDateTimeType;
       max_varchar_len = 0;
       break;
     case ST_VARCHAR:
@@ -475,45 +506,183 @@ void ObFileSqlUtils::ColInfer::finish(ObObjType &data_type,
   }
 }
 
-int ObFileSqlUtils::infer_column_schemas(const ObString &file_url,
-                                         ObFileScanFormat format,
-                                         const ObCSVGeneralFormat &format_opt,
-                                         common::ObIAllocator &allocator,
-                                         common::ObIArray<ObFileScanColMeta> &col_metas)
+namespace
+{
+
+/// build a unique column name: empty header fields become columnN and
+/// duplicate names get a __N suffix (id, id -> id, id__2).
+int build_unique_column_name(const ObString &raw_name,
+                             const int64_t column_idx,
+                             common::ObIAllocator &allocator,
+                             const common::ObIArray<ObFileScanColMeta> &col_metas,
+                             ObString &name)
 {
   int ret = OB_SUCCESS;
-  ObString content;
-  ObArenaAllocator arena(allocator);
-  if (OB_FAIL(read_whole_file(file_url, arena, content))) {
-  } else if (format == ObFileScanFormat::CSV) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "infer schema");
-  } else {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "infer schema");
+  ObSqlString candidate;
+  ObString base = raw_name;
+  if (base.empty()) {
+    if (OB_FAIL(candidate.append_fmt("column%ld", column_idx))) {
+      LOG_WARN("failed to build column name", K(ret), K(column_idx));
+    }
+  } else if (OB_FAIL(candidate.assign(base))) {
+    LOG_WARN("failed to build column name", K(ret));
+  }
+  int64_t suffix = 2;
+  bool duplicated = true;
+  while (OB_SUCC(ret) && duplicated) {
+    duplicated = false;
+    for (int64_t i = 0; !duplicated && i < col_metas.count(); ++i) {
+      duplicated = (col_metas.at(i).name_ == ObString(candidate.length(), candidate.ptr()));
+    }
+    if (OB_SUCC(ret) && duplicated) {
+      candidate.reuse();
+      if (base.empty()) {
+        ret = candidate.append_fmt("column%ld__%ld", column_idx, suffix++);
+      } else {
+        ret = candidate.append_fmt("%.*s__%ld", base.length(), base.ptr(), suffix++);
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("failed to build unique column name", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ob_write_string(allocator,
+                                ObString(candidate.length(), candidate.ptr()),
+                                name))) {
+      LOG_WARN("failed to copy column name", K(ret));
+    }
   }
   return ret;
 }
 
-int ObFileSqlUtils::compute_file_signature(const ObString &file_url,
-                                           ObString &signature,
-                                           int64_t &size,
-                                           int64_t &mtime)
+/// stream the CSV file once and infer every column type.
+int infer_csv_column_schemas(const ObString &file_url,
+                             const ObCSVGeneralFormat &format_opt,
+                             common::ObIAllocator &allocator,
+                             common::ObIArray<ObFileScanColMeta> &col_metas,
+                             int64_t *row_cnt)
 {
   int ret = OB_SUCCESS;
-  struct stat stat_info;
-  if (0 != stat(file_url.ptr(), &stat_info)) {
-    ret = OB_FILE_NOT_EXIST;
-    LOG_USER_ERROR(OB_FILE_NOT_EXIST, file_url.length(), file_url.ptr());
+  ObFileCsvReader reader;
+  ObSEArray<ObFileCsvField, 16> fields;
+  ObSEArray<ObFileSqlUtils::ColInfer, 16> infer_states;
+  ObSEArray<bool, 16> nullable_flags;
+  int64_t column_cnt = 0;
+  int64_t record_cnt = 0;
+  if (OB_FAIL(reader.open(file_url, format_opt, allocator))) {
+    LOG_WARN("failed to open csv file", K(ret), K(file_url));
   } else {
-    size = stat_info.st_size;
-    mtime = stat_info.st_mtime;
-    ObSqlString sig;
-    if (OB_FAIL(sig.append_fmt("%s:%ld:%ld", file_url.ptr(), size, mtime))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
-      signature.assign(sig.ptr(), sig.length());
+    // the header names, if any, fix the column count up front
+    const ObIArray<ObString> &header = reader.get_header();
+    if (reader.has_header() && header.count() > 0) {
+      column_cnt = header.count();
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+        ObFileScanColMeta meta;
+        if (OB_FAIL(build_unique_column_name(header.at(i), i, allocator, col_metas, meta.name_))) {
+          LOG_WARN("failed to build column name", K(ret), K(i));
+        } else if (OB_FAIL(col_metas.push_back(meta))) {
+          LOG_WARN("failed to add column meta", K(ret));
+        } else if (OB_FAIL(infer_states.push_back(ObFileSqlUtils::ColInfer()))) {
+          LOG_WARN("failed to add inference state", K(ret));
+        } else if (OB_FAIL(nullable_flags.push_back(false))) {
+          LOG_WARN("failed to add nullable flag", K(ret));
+        }
+      }
     }
+  }
+
+  while (OB_SUCC(ret)) {
+    fields.reuse();
+    if (OB_FAIL(reader.next_record(fields))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        break;
+      } else if (OB_ERR_UNEXPECTED == ret) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "malformed CSV record at line %ld",
+                 static_cast<long>(reader.get_record_no()));
+        LOG_WARN("malformed csv record", K(ret), "record_no", reader.get_record_no());
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, msg);
+      } else {
+        LOG_WARN("failed to read csv record", K(ret));
+      }
+    } else if (0 == column_cnt) {
+      // no header: derive the column count from the first data record
+      column_cnt = fields.count();
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+        ObFileScanColMeta meta;
+        if (OB_FAIL(build_unique_column_name(ObString(), i, allocator, col_metas, meta.name_))) {
+          LOG_WARN("failed to build column name", K(ret), K(i));
+        } else if (OB_FAIL(col_metas.push_back(meta))) {
+          LOG_WARN("failed to add column meta", K(ret));
+        } else if (OB_FAIL(infer_states.push_back(ObFileSqlUtils::ColInfer()))) {
+          LOG_WARN("failed to add inference state", K(ret));
+        } else if (OB_FAIL(nullable_flags.push_back(false))) {
+          LOG_WARN("failed to add nullable flag", K(ret));
+        }
+      }
+    } else if (fields.count() != column_cnt) {
+      ret = OB_ERR_WRONG_VALUE_COUNT_ON_ROW;
+      LOG_WARN("csv record has a wrong number of fields", K(ret),
+               K(column_cnt), K(fields.count()), "record_no", reader.get_record_no());
+      LOG_USER_ERROR(OB_ERR_WRONG_VALUE_COUNT_ON_ROW, static_cast<int32_t>(reader.get_record_no()));
+    }
+
+    ++record_cnt;
+    for (int64_t i = 0; OB_SUCC(ret) && i < fields.count(); ++i) {
+      const ObFileCsvField &field = fields.at(i);
+      if (field.is_null_) {
+        nullable_flags.at(i) = true;
+      } else {
+        infer_states.at(i).feed_field(ObString(field.len_, field.ptr_), format_opt.cs_type_);
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    // nothing to do
+  } else if (0 == column_cnt) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("csv file has no readable columns", K(ret), K(file_url));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+      ObObjType data_type = ObNullType;
+      int32_t max_varchar_len = 0;
+      ObCollationType collation_type = CS_TYPE_UTF8MB4_BIN;
+      infer_states.at(i).finish(data_type, max_varchar_len, collation_type);
+      if (ObNullType == data_type) {
+        // a column with only NULL values is exposed as VARCHAR
+        data_type = ObVarcharType;
+        max_varchar_len = 1;
+      }
+      col_metas.at(i).type_ = data_type;
+      col_metas.at(i).length_ = max_varchar_len;
+      col_metas.at(i).nullable_ = nullable_flags.at(i);
+    }
+  }
+  if (OB_SUCC(ret) && NULL != row_cnt) {
+    *row_cnt = record_cnt;
+  }
+  reader.close();
+  return ret;
+}
+
+} // namespace
+
+int ObFileSqlUtils::infer_column_schemas(const ObString &file_url,
+                                         ObFileScanFormat format,
+                                         const ObCSVGeneralFormat &format_opt,
+                                         common::ObIAllocator &allocator,
+                                         common::ObIArray<ObFileScanColMeta> &col_metas,
+                                         int64_t *row_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (ObFileScanFormat::CSV == format) {
+    ret = infer_csv_column_schemas(file_url, format_opt, allocator, col_metas, row_cnt);
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "infer schema for this file format");
   }
   return ret;
 }

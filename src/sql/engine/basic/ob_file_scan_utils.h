@@ -81,7 +81,7 @@ public:
    * returns OB_NOT_SUPPORTED for unsupported options.
    */
   static int build_csv_format(const common::ObIArray<ObFileSqlArg> &args,
-                              common::ObArenaAllocator &allocator,
+                              common::ObIAllocator &allocator,
                               ObCSVGeneralFormat &csv_format);
 
   /**
@@ -91,7 +91,7 @@ public:
    * returns OB_NOT_SUPPORTED for unsupported options.
    */
   static int build_json_format(const common::ObIArray<ObFileSqlArg> &args,
-                               common::ObArenaAllocator &allocator,
+                               common::ObIAllocator &allocator,
                                ObCSVGeneralFormat &json_format);
 
   /**
@@ -151,12 +151,12 @@ public:
                                   ObFileScanFormat format,
                                   const ObCSVGeneralFormat &format_opt,
                                   common::ObIAllocator &allocator,
-                                  common::ObIArray<ObFileScanColMeta> &col_metas);
+                                  common::ObIArray<ObFileScanColMeta> &col_metas,
+                                  int64_t *row_cnt = NULL);
 
   /**
    * compute a change signature (path, size, mtime) for a file URL
    */
-  static int compute_file_signature(const ObString &file_url, ObString &signature, int64_t &size, int64_t &mtime);
 };
 
 } // namespace sql
