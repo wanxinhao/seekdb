@@ -20,6 +20,8 @@
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "share/ob_server_struct.h"
 #include "sql/engine/cmd/ob_table_executor.h"
+#include "sql/session/ob_inner_sql_connection.h"
+#include "query/api/query/session/ob_inner_sql_connection_access.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/command/ob_root_service_serialization.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -751,8 +753,49 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+int ObAlterTableExecutor::execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = GET_MY_SESSION(ctx);
+  const ObAlterTableStmt::AiColumnRetryInfo &info = stmt.get_ai_column_retry();
+  ObSqlString sql;
+  ObIInnerSQLConnection *inner_conn = NULL;
+  ObSQLSessionInfo::StmtSavedValue saved_session;
+  ObIInnerSQLConnection::SavedValue saved_conn;
+  common::sqlclient::ObISQLConnectionGuard conn_guard;
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(session)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(sql.append_fmt("UPDATE `%.*s`.`%.*s` SET `%.*s` = NULL",
+                                    stmt.get_database_name().length(), stmt.get_database_name().ptr(),
+                                    stmt.get_table_name().length(), stmt.get_table_name().ptr(),
+                                    info.column_name_.length(), info.column_name_.ptr()))) {
+  } else if (info.has_where_ && OB_FAIL(sql.append_fmt(" WHERE %.*s",
+                                                       info.where_text_.length(), info.where_text_.ptr()))) {
+  } else if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
+                     session, conn_guard))) {
+  } else if (OB_ISNULL(inner_conn = as_inner_sql_connection(session->get_inner_conn()))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    session->set_inner_conn(conn_guard.get_ptr());
+    // the invalidation is performed by the DML hook, which creates the
+    // generation tasks inside the same transaction
+    const int32_t saved_mode = session->get_ai_column_internal_mode();
+    session->set_ai_column_internal_mode(ObSQLSessionInfo::AI_COL_MODE_INVALIDATE);
+    if (OB_FAIL(inner_conn->begin_nested_session(saved_session, saved_conn, false))) {
+    } else if (OB_FAIL(inner_conn->execute_write(sql.ptr(), affected_rows))) {
+    } else if (OB_FAIL(inner_conn->end_nested_session(saved_session, saved_conn))) {
+    }
+    session->set_ai_column_internal_mode(saved_mode);
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
+  if (stmt.has_ai_column_retry()) {
+    return execute_ai_column_retry(ctx, stmt);
+  }
   int ret = OB_SUCCESS;
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();

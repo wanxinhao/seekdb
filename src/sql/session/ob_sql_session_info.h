@@ -130,6 +130,14 @@ public:
   uint32_t sessid_;
 };
 
+// Internal execution mode of the asynchronous AI column feature.
+enum AiColumnInternalMode
+{
+  AI_COL_MODE_NONE = 0,      // ordinary user session
+  AI_COL_MODE_PUBLISH = 1,   // the background worker publishes a result
+  AI_COL_MODE_INVALIDATE = 2 // an internal session invalidates a result
+};
+
 struct ObSessionStat final
 {
   ObSessionStat() : total_logical_read_(0), total_physical_read_(0), total_logical_write_(0),
@@ -399,6 +407,40 @@ public:
     TO_STRING_KV(K_(module_name), K_(action_name), K_(client_info));
   };
 
+
+public:
+  // Internal execution modes used by the asynchronous AI column feature:
+  // the worker publishes results and the RETRY action invalidates rows.
+  enum AiColumnInternalMode
+  {
+    AI_COL_MODE_NONE = 0,
+    AI_COL_MODE_PUBLISH = 1,
+    AI_COL_MODE_INVALIDATE = 2
+  };
+  int set_ai_column_internal_mode(const int32_t mode)
+  {
+    ai_column_internal_mode_ = mode;
+    return OB_SUCCESS;
+  }
+  int32_t get_ai_column_internal_mode() const { return ai_column_internal_mode_; }
+  int set_ai_column_publish_request_id(const common::ObString &request_id)
+  {
+    int ret = OB_SUCCESS;
+    if (request_id.length() >= sizeof(ai_column_publish_request_id_)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      if (request_id.length() > 0) {
+        MEMCPY(ai_column_publish_request_id_, request_id.ptr(), request_id.length());
+      }
+      ai_column_publish_request_id_[request_id.length()] = '\0';
+      ai_column_publish_request_id_len_ = static_cast<int32_t>(request_id.length());
+    }
+    return ret;
+  }
+  common::ObString get_ai_column_publish_request_id() const
+  {
+    return common::ObString(ai_column_publish_request_id_len_, ai_column_publish_request_id_);
+  }
 
 public:
   ObSQLSessionInfo();
@@ -834,6 +876,17 @@ public:
   }
   void set_load_data_exec_session(bool v) { is_load_data_exec_session_ = v; }
   bool is_load_data_exec_session() const { return is_load_data_exec_session_; }
+  // Internal execution mode of the asynchronous AI column feature.  A normal
+  // user session (AI_COL_MODE_NONE) is not allowed to write an AI result
+  // column, the internal modes waive the write protection and describe the
+  // meaning of the write:
+  //   AI_COL_MODE_PUBLISH   : the worker publishes a generated result.
+  //   AI_COL_MODE_INVALIDATE: an internal session invalidates a result.
+  void set_ai_column_internal_mode(AiColumnInternalMode mode) { ai_column_internal_mode_ = mode; }
+  AiColumnInternalMode get_ai_column_internal_mode() const { return ai_column_internal_mode_; }
+  // The request id of the group that is currently published.
+  void set_ai_column_publish_request_id(const ObString &request_id) { ai_column_publish_request_id_ = request_id; }
+  ObString get_ai_column_publish_request_id() const { return ai_column_publish_request_id_; }
   inline ObSqlString &get_pl_exact_err_msg() { return pl_exact_err_msg_; }
   void set_got_server_conn_res(bool v) { got_server_conn_res_ = v; }
   bool has_got_server_conn_res() const { return got_server_conn_res_; }
@@ -871,6 +924,9 @@ public:
   { return data_plane::tx_desc_has_temporary_tables(tx_desc_); }
   int close_all_ps_stmt(ObPsCache &ps_cache);
 private:
+  int32_t ai_column_internal_mode_;
+  int32_t ai_column_publish_request_id_len_;
+  char ai_column_publish_request_id_[64];
   void release_all_ps_session_info();
   void set_cur_exec_ctx(ObExecContext *cur_exec_ctx) { cur_exec_ctx_ = cur_exec_ctx; }
 
@@ -988,6 +1044,9 @@ private:
   bool is_table_name_hidden_;
   ObPieceCache* piece_cache_;
   bool is_load_data_exec_session_;
+  // Internal execution mode and publish request id of the AI column feature.
+  AiColumnInternalMode ai_column_internal_mode_;
+  ObString ai_column_publish_request_id_;
   ObSqlString pl_exact_err_msg_;
   bool is_varparams_sql_prepare_;
   // Record whether this session has got connection resource, which means it increased connections count.

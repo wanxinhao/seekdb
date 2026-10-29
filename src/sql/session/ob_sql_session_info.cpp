@@ -108,6 +108,9 @@ void ObCachedSchemaGuardInfo::try_revert_schema_guard()
 ObSQLSessionInfo::ObSQLSessionInfo() :
       ObVersionProvider(),
       ObBasicSessionInfo{},
+      ai_column_internal_mode_(ObSQLSessionInfo::AI_COL_MODE_NONE),
+      ai_column_publish_request_id_len_(0),
+      ai_column_publish_request_id_(),
       is_inited_(false),
       warnings_buf_(),
       show_warnings_buf_(),
@@ -149,6 +152,8 @@ ObSQLSessionInfo::ObSQLSessionInfo() :
       is_table_name_hidden_(false),
       piece_cache_(NULL),
       is_load_data_exec_session_(false),
+      ai_column_internal_mode_(AI_COL_MODE_NONE),
+      ai_column_publish_request_id_(),
       pl_exact_err_msg_(),
       is_varparams_sql_prepare_(false),
       got_server_conn_res_(false),
