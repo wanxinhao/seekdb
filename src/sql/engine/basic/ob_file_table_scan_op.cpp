@@ -210,18 +210,25 @@ int ObFileTableScanOp::check_file_unchanged(const int64_t file_size,
   int ret = OB_SUCCESS;
   struct stat file_stat;
   MEMSET(&file_stat, 0, sizeof(file_stat));
-  if (OB_UNLIKELY(0 == MY_SPEC.file_path_.length())) {
+  const int64_t path_len = MY_SPEC.file_path_.length();
+  if (OB_UNLIKELY(0 == path_len || path_len > PATH_MAX)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("file path is empty", K(ret));
-  } else if (0 != ::stat(MY_SPEC.file_path_.ptr(), &file_stat)) {
-    ret = OB_FILE_NOT_EXIST;
-    LOG_WARN("failed to stat file", K(ret), K(MY_SPEC.file_path_));
-  } else if (file_stat.st_size != file_size ||
-             static_cast<int64_t>(file_stat.st_mtime) != file_mtime) {
-    ret = OB_TABLE_DEFINITION_CHANGED;
-    LOG_WARN("file has been modified after the schema was inferred", K(ret),
-             K(MY_SPEC.file_path_), K(file_size), "current_size", file_stat.st_size,
-             K(file_mtime), "current_mtime", file_stat.st_mtime);
+    LOG_WARN("invalid file path", K(ret), K(MY_SPEC.file_path_));
+  } else {
+    // the deep copied path is not null terminated, build a c string for stat
+    char path_buf[PATH_MAX + 1];
+    MEMCPY(path_buf, MY_SPEC.file_path_.ptr(), path_len);
+    path_buf[path_len] = '\0';
+    if (0 != ::stat(path_buf, &file_stat)) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("failed to stat file", K(ret), K(MY_SPEC.file_path_));
+    } else if (file_stat.st_size != file_size ||
+               static_cast<int64_t>(file_stat.st_mtime) != file_mtime) {
+      ret = OB_TABLE_DEFINITION_CHANGED;
+      LOG_WARN("file has been modified after the schema was inferred", K(ret),
+               K(MY_SPEC.file_path_), K(file_size), "current_size", file_stat.st_size,
+               K(file_mtime), "current_mtime", file_stat.st_mtime);
+    }
   }
   return ret;
 }
@@ -334,7 +341,7 @@ int ObFileTableScanOp::convert_field(const ObFileCsvField &field,
   return ret;
 }
 
-int ObFileTableScanOp::fill_row(const int64_t row_idx)
+int ObFileTableScanOp::fill_row()
 {
   int ret = OB_SUCCESS;
   const ObFileTableScanSpec &spec = static_cast<const ObFileTableScanSpec &>(spec_);
@@ -345,56 +352,14 @@ int ObFileTableScanOp::fill_row(const int64_t row_idx)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid file table scan column", K(ret), K(i), K(field_idx));
     } else {
-      // is_batch_result() is always true in batch mode, but keep the check so
-      // that the operator also works if it is walked row by row.
-      ObDatum *datums = expr->locate_batch_datums(eval_ctx_);
-      ObDatum &datum = expr->is_batch_result() ? datums[row_idx] : datums[0];
+      // The ObDatum value setters (set_int/set_double/set_date/...) store the
+      // value *through* %ptr_, so the pointer has to be pointed at the reserved
+      // buffer of the expression first.  locate_datum_for_write() does that,
+      // locate_batch_datums() does not.
+      ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
       if (OB_FAIL(convert_field(fields_.at(field_idx), expr->datum_meta_.type_, datum))) {
         LOG_WARN("failed to convert csv field", K(ret), K(i), K(field_idx));
       }
-    }
-  }
-  return ret;
-}
-
-int ObFileTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
-{
-  int ret = OB_SUCCESS;
-  const ObFileTableScanSpec &spec = static_cast<const ObFileTableScanSpec &>(spec_);
-  const int64_t batch_size = std::min(max_row_cnt, spec.max_batch_size_);
-  int64_t read_cnt = 0;
-  bool is_end = false;
-  if (OB_UNLIKELY(0 == spec.column_count_) || 0 == batch_size) {
-    brs_.size_ = 0;
-    brs_.end_ = true;
-  } else if (OB_FAIL(try_check_status())) {
-    LOG_WARN("failed to check status", K(ret));
-  } else {
-    str_alloc_.reset();
-    clear_evaluated_flag();
-    while (OB_SUCC(ret) && !is_end && read_cnt < batch_size) {
-      fields_.reuse();
-      if (OB_FAIL(reader_.next_record(fields_))) {
-        if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
-          is_end = true;
-        } else {
-          LOG_WARN("failed to read csv record", K(ret), K(reader_.get_record_no()));
-        }
-      } else if (OB_UNLIKELY(fields_.count() != spec.column_count_)) {
-        ret = OB_INVALID_DATA;
-        LOG_WARN("csv record has an unexpected number of fields", K(ret),
-                 "record_no", reader_.get_record_no(),
-                 "expected", spec.column_count_, "actual", fields_.count());
-      } else if (OB_FAIL(fill_row(read_cnt))) {
-        LOG_WARN("failed to fill csv record", K(ret), "row", read_cnt);
-      } else {
-        ++read_cnt;
-      }
-    }
-    if (OB_SUCC(ret)) {
-      brs_.size_ = read_cnt;
-      brs_.end_ = is_end;
     }
   }
   return ret;
@@ -404,7 +369,9 @@ int ObFileTableScanOp::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
   const ObFileTableScanSpec &spec = static_cast<const ObFileTableScanSpec &>(spec_);
-  str_alloc_.reset();
+  // the string values of the previous row are not referenced any more, release
+  // them so that the whole file is never materialized in memory
+  str_alloc_.reset_remain_one_page();
   clear_evaluated_flag();
   fields_.reuse();
   if (OB_UNLIKELY(0 == spec.column_count_)) {
@@ -420,7 +387,7 @@ int ObFileTableScanOp::inner_get_next_row()
     LOG_WARN("csv record has an unexpected number of fields", K(ret),
              "record_no", reader_.get_record_no(),
              "expected", spec.column_count_, "actual", fields_.count());
-  } else if (OB_FAIL(fill_row(0))) {
+  } else if (OB_FAIL(fill_row())) {
     LOG_WARN("failed to fill csv record", K(ret));
   }
   return ret;

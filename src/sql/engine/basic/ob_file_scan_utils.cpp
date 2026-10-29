@@ -481,6 +481,7 @@ void ObFileSqlUtils::ColInfer::finish(ObObjType &data_type,
       max_varchar_len = 0;
       break;
     case ST_INT:
+      // ObIntType is a 64 bit integer in oceanbase, its sql type name is BIGINT
       data_type = ObIntType;
       max_varchar_len = 0;
       break;

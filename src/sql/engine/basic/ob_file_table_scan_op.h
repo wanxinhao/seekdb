@@ -68,7 +68,6 @@ public:
   virtual int inner_open() override;
   virtual int inner_rescan() override;
   virtual int inner_get_next_row() override;
-  virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
   virtual int inner_close() override;
   virtual void destroy() override;
 private:
@@ -77,7 +76,7 @@ private:
   int convert_field(const ObFileCsvField &field,
                     const ObObjType type,
                     ObDatum &datum);
-  int fill_row(const int64_t row_idx);
+  int fill_row();
 private:
   ObFileCsvReader reader_;
   ObCSVGeneralFormat csv_format_;

@@ -1756,10 +1756,12 @@ int ObStaticEngineCG::generate_spec(ObLogFileTableScan &op,
   if (OB_ISNULL(table_def)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("file table def is null", K(ret));
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, table_def->file_path_, spec.file_path_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, table_def->file_path_, spec.file_path_,
+                                     true/*c_style*/))) {
     LOG_WARN("failed to deep copy file path", K(ret));
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, table_def->csv_format_.field_term_str_,
-                                         spec.field_term_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, table_def->csv_format_.field_term_str_,
+                                     spec.field_term_,
+                                     true/*c_style*/))) {
     LOG_WARN("failed to deep copy field terminator", K(ret));
   } else if (OB_FAIL(spec.column_exprs_.prepare_allocate(op.get_column_exprs().count()))) {
     LOG_WARN("failed to prepare allocate column exprs", K(ret));
@@ -1803,7 +1805,8 @@ int ObStaticEngineCG::generate_spec(ObLogFileTableScan &op,
     spec.trim_space_ = format.trim_space_;
     spec.empty_field_as_null_ = format.empty_field_as_null_;
     if (format.null_if_.count() > 0) {
-      if (OB_FAIL(deep_copy_ob_string(allocator, format.null_if_.at(0), spec.null_str_))) {
+      if (OB_FAIL(ob_write_string(allocator, format.null_if_.at(0), spec.null_str_,
+                                  true/*c_style*/))) {
         LOG_WARN("failed to deep copy null literal", K(ret));
       }
     }

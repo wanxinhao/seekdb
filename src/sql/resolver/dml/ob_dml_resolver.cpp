@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "ob_dml_resolver.h"
+#include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -11096,15 +11097,101 @@ int ObDMLResolver::resolve_table_dynamic_sampling_hint(const ParseNode &hint_nod
 }
 
 // OB-P:a4L9E_IDIyEM2Ol_ZvDXqw
+// Tell whether the literal of a file table function argument is a string.
+//
+// The fast parser of the plan cache turns the literal of an argument into a
+// T_QUESTIONMARK constant node and keeps the original text of the literal in
+// %raw_text_.  A quoted text marks a string literal, an unquoted one marks a
+// number or a boolean literal.
+static inline bool is_file_sql_quoted_text(const ParseNode *node)
+{
+  return NULL != node && NULL != node->raw_text_ && node->text_len_ > 0
+         && ('\'' == node->raw_text_[0] || '"' == node->raw_text_[0]);
+}
+
+// OB-P:a4L9E_IDIyEM2Ol_ZvDXqw
 // A file table function argument is a string literal.  Because of plan cache
 // fast-parameterize, the literal may arrive as T_QUESTIONMARK (with the original
 // string preserved in str_value_) rather than T_VARCHAR/T_CHAR.
 static inline bool is_file_sql_string_node(const ParseNode *node)
 {
-  return NULL != node
-         && (T_VARCHAR == node->type_ || T_CHAR == node->type_
-             || (T_QUESTIONMARK == node->type_ && NULL != node->str_value_
-                 && node->str_len_ > 0));
+  if (NULL == node) {
+    return false;
+  }
+  if (T_VARCHAR == node->type_ || T_CHAR == node->type_) {
+    return true;
+  }
+  if (T_QUESTIONMARK != node->type_) {
+    return false;
+  }
+  if (NULL != node->raw_text_ && node->text_len_ > 0) {
+    // the original text of the literal tells a string from a number
+    return is_file_sql_quoted_text(node);
+  }
+  // no original text, fall back to the text of the value
+  return NULL != node->str_value_ && node->str_len_ > 0;
+}
+
+// OB-P:a4L9E_IDIyEM2Ol_ZvDXqw
+// Resolve the value of a named option of a file table function.
+//
+// The fast parser of the plan cache turns the literal of an option value into
+// a T_QUESTIONMARK constant node, so the type of the node alone does not tell
+// what the literal was:
+//   * %str_value_ keeps the text of a string or a numeric literal,
+//   * %raw_text_ keeps the original text of the literal,
+//   * %is_literal_bool_ marks a TRUE/FALSE literal,
+//   * %is_neg_ marks a negative number.
+static int resolve_file_table_option_value(ObIAllocator &allocator,
+                                           const ParseNode &value_node,
+                                           ObFileSqlArg &arg)
+{
+  int ret = OB_SUCCESS;
+  const ObString text(value_node.str_len_, value_node.str_value_);
+  const ObString raw_text(value_node.text_len_, value_node.raw_text_);
+  if (is_file_sql_string_node(&value_node)) {
+    // a string literal
+    arg.kind_ = ObFileSqlArg::STRING;
+    if (OB_FAIL(ob_write_string(allocator, text, arg.str_value_))) {
+      LOG_WARN("failed to copy option value", K(ret));
+    }
+  } else if (value_node.is_literal_bool_) {
+    // a TRUE/FALSE literal
+    arg.kind_ = ObFileSqlArg::BOOL;
+    arg.int_value_ = (NULL != raw_text.ptr() && raw_text.case_compare_equal("true")) ? 1 : 0;
+  } else if (OB_LIKELY(T_INT == value_node.type_ || T_UINT64 == value_node.type_
+                       || T_NUMBER == value_node.type_ || T_QUESTIONMARK == value_node.type_)) {
+    // a numeric literal
+    int64_t int_value = 0;
+    if (text.length() > 0) {
+      // the text of the literal is kept, it already carries the sign
+      const char *begin = text.ptr();
+      const char *end = begin + text.length();
+      char *stop = NULL;
+      errno = 0;
+      const int64_t parsed = strtoll(begin, &stop, 10);
+      if (NULL == stop || stop != end || 0 != errno) {
+        ret = OB_INVALID_DATA;
+      } else {
+        int_value = parsed;
+      }
+    } else {
+      int_value = value_node.is_neg_ ? -value_node.value_ : value_node.value_;
+    }
+    if (OB_SUCC(ret)) {
+      arg.kind_ = ObFileSqlArg::INT;
+      arg.int_value_ = int_value;
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file table function option");
+      LOG_WARN("invalid numeric file table function option value", K(ret), K(text));
+    }
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file table function option");
+    LOG_WARN("unsupported file table function argument value", K(ret), K(value_node.type_));
+  }
+  return ret;
 }
 
 int ObDMLResolver::resolve_file_table_args(const ParseNode &args_node,
@@ -11135,37 +11222,28 @@ int ObDMLResolver::resolve_file_table_args(const ParseNode &args_node,
         LOG_WARN("failed to copy argument name", K(ret));
       } else if (is_file_sql_string_node(value_node)) {
         arg.kind_ = ObFileSqlArg::STRING;
+        // c_style: the value is kept as a null terminated c string, the file
+        // path is passed to the file system api which expects one
         if (OB_FAIL(ob_write_string(*allocator_,
                                     ObString(static_cast<int32_t>(value_node->str_len_),
                                              value_node->str_value_),
-                                    arg.str_value_))) {
+                                    arg.str_value_,
+                                    true/*c_style*/))) {
           LOG_WARN("failed to copy argument value", K(ret));
         }
-      } else if (T_BOOL == value_node->type_) {
-        arg.kind_ = ObFileSqlArg::BOOL;
-        arg.int_value_ = value_node->value_;
-      } else if (T_INT == value_node->type_) {
-        arg.kind_ = ObFileSqlArg::INT;
-        arg.int_value_ = value_node->value_;
-      } else if (T_OP_NEG == value_node->type_ && 1 == value_node->num_child_ &&
-                 OB_NOT_NULL(value_node->children_) &&
-                 OB_NOT_NULL(value_node->children_[0]) &&
-                 T_INT == value_node->children_[0]->type_) {
-        arg.kind_ = ObFileSqlArg::INT;
-        arg.int_value_ = -value_node->children_[0]->value_;
-      } else {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file table function option");
-        LOG_WARN("unsupported file table function argument value", K(ret), K(i),
-                 K(value_node->type_));
-      }
+      } else if (OB_FAIL(resolve_file_table_option_value(*allocator_, *value_node, arg))) {
+        LOG_WARN("failed to resolve file table function argument value", K(ret), K(i));
+      } else { /*do nothing*/ }
     } else if (0 == args.count() && is_file_sql_string_node(arg_node)) {
       // the first positional argument is the file path
       arg.kind_ = ObFileSqlArg::STRING;
+      // c_style: the path is passed to the file system api which expects a
+      // null terminated c string
       if (OB_FAIL(ob_write_string(*allocator_,
                                   ObString(static_cast<int32_t>(arg_node->str_len_),
                                            arg_node->str_value_),
-                                  arg.str_value_))) {
+                                  arg.str_value_,
+                                  true/*c_style*/))) {
         LOG_WARN("failed to copy file path argument", K(ret));
       } else {
         file_path = arg.str_value_;
@@ -11300,10 +11378,8 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &table_node,
   } else {
     // normalize the path and check it against secure_file_priv
     char *actual_path = NULL;
-    ObSqlString path_str;
-    if (OB_FAIL(path_str.append(file_path))) {
-      LOG_WARN("failed to copy file path", K(ret));
-    } else if (OB_ISNULL(actual_path = ::realpath(path_str.ptr(), full_path_buf))) {
+    // the file path is a null terminated c string, see resolve_file_table_args
+    if (OB_ISNULL(actual_path = ::realpath(file_path.ptr(), full_path_buf))) {
       ret = OB_FILE_NOT_EXIST;
       LOG_USER_ERROR(OB_FILE_NOT_EXIST, file_path.length(), file_path.ptr());
       LOG_WARN("file does not exist", K(ret), K(file_path));
@@ -11315,7 +11391,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &table_node,
         ret = OB_ERR_NO_PRIV_DIRECT_PATH_ACCESS;
       }
       LOG_WARN("file path is not allowed", K(ret), K(secure_file_priv), KCSTRING(actual_path));
-    } else if (OB_FAIL(ob_write_string(*allocator_, ObString(actual_path), abs_path))) {
+    } else if (OB_FAIL(ob_write_string(*allocator_, ObString(actual_path), abs_path, true/*c_style*/))) {
       LOG_WARN("failed to copy absolute file path", K(ret));
     }
   }

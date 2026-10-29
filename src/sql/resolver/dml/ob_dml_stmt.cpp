@@ -4497,7 +4497,7 @@ int ObFileTableDef::deep_copy(const ObFileTableDef &other,
   UNUSED(expr_copier);
   if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(ob_write_string(*allocator, other.file_path_, file_path_))) {
+  } else if (OB_FAIL(ob_write_string(*allocator, other.file_path_, file_path_, true/*c_style*/))) {
   } else {
     format_ = other.format_;
     file_size_ = other.file_size_;
